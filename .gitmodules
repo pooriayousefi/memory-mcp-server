@@ -1,0 +1,3 @@
+[submodule "external/mcpxx"]
+	path = external/mcpxx
+	url = https://github.com/pooriayousefi/mcpxx.git
