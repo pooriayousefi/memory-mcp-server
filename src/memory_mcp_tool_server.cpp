@@ -34,6 +34,8 @@
 #include "pooriayousefi/mcp/server.hpp"
 
 #include <cstdint>
+#include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -42,6 +44,13 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace pooriayousefi::mcp
 {
@@ -70,7 +79,7 @@ namespace pooriayousefi::mcp
     class MemoryStore
     {
     public:
-        using Watcher = std::function<void(const Json&)>;
+        using Watcher = std::function<bool(const Json&)>;
 
         explicit MemoryStore(const std::string& file_path)
             : file_path_{file_path}
@@ -84,28 +93,32 @@ namespace pooriayousefi::mcp
             watchers_.push_back(std::move(w));
         }
 
-        void save_entry(const std::string& key, const Json& value)
+        bool save_entry(const std::string& key, const Json& value)
         {
-            std::shared_ptr<Json> new_state;
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto new_state = std::make_shared<Json>(*data_);
+            (*new_state)[key] = value;
 
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                new_state = std::make_shared<Json>(*data_);
-                (*new_state)[key] = value;
-                data_ = new_state;
-            }
-
-            for (const auto& w : watchers_)
+            // Persist before publishing the new in-memory snapshot. A failed
+            // write therefore leaves both the old disk and memory state intact.
+            for (const auto& watcher : watchers_)
             {
                 try
                 {
-                    w(*new_state);
+                    if (!watcher(*new_state))
+                    {
+                        return false;
+                    }
                 }
-                catch (const std::exception& e)
+                catch (const std::exception& failure)
                 {
-                    std::cerr << "Memory watcher error: " << e.what() << std::endl;
+                    std::cerr << "Memory watcher error: " << failure.what() << std::endl;
+                    return false;
                 }
             }
+
+            data_ = std::move(new_state);
+            return true;
         }
 
         Json recall_entry(const std::string& key) const
@@ -186,11 +199,20 @@ namespace pooriayousefi::mcp
         }
         else
         {
-            store.save_entry(key_or_error.get_value(), args["value"]);
-            result.set_value(Json{
-                {"message", "Memory saved successfully."},
-                {"key", key_or_error.get_value()}
-            });
+            if (!store.save_entry(key_or_error.get_value(), args["value"]))
+            {
+                result.set_error(Error{
+                    error_code::INTERNAL_ERROR,
+                    "Failed to persist memory snapshot; the previous state was retained."
+                });
+            }
+            else
+            {
+                result.set_value(Json{
+                    {"message", "Memory saved successfully."},
+                    {"key", key_or_error.get_value()}
+                });
+            }
         }
 
         return result;
@@ -243,22 +265,61 @@ int main(int argc, char* argv[])
     using namespace pooriayousefi;
     using namespace pooriayousefi::mcp;
 
-    std::mutex file_write_mutex;
     MemoryStore store{DEFAULT_MEMORY_FILE};
 
     store.add_watch(
-        [&file_write_mutex](const Json& new_state)
+        [](const Json& new_state) -> bool
         {
-            std::lock_guard<std::mutex> lock(file_write_mutex);
-            std::ofstream file(DEFAULT_MEMORY_FILE);
-            if (file)
+            namespace fs = std::filesystem;
+            const fs::path destination{DEFAULT_MEMORY_FILE};
+            const fs::path temporary{std::string(DEFAULT_MEMORY_FILE) + ".tmp"};
+
             {
+                std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+                if (!file)
+                {
+                    std::cerr << "Failed to open temporary memory snapshot: " << temporary << std::endl;
+                    return false;
+                }
+
                 file << new_state.dump(2);
+                file.flush();
+                if (!file)
+                {
+                    std::cerr << "Failed to write memory snapshot: " << temporary << std::endl;
+                    file.close();
+                    std::error_code ignored;
+                    fs::remove(temporary, ignored);
+                    return false;
+                }
             }
-            else
+
+#ifdef _WIN32
+            const bool replaced = ::MoveFileExW(
+                temporary.c_str(),
+                destination.c_str(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+            ) != 0;
+            if (!replaced)
             {
-                std::cerr << "Failed to save memory to: " << DEFAULT_MEMORY_FILE << std::endl;
+                const DWORD error = ::GetLastError();
+                std::cerr << "Failed to replace memory snapshot (Windows error "
+                          << error << ")." << std::endl;
+                std::error_code ignored;
+                fs::remove(temporary, ignored);
+                return false;
             }
+#else
+            if (std::rename(temporary.c_str(), destination.c_str()) != 0)
+            {
+                std::cerr << "Failed to atomically replace memory snapshot: "
+                          << destination << std::endl;
+                std::error_code ignored;
+                fs::remove(temporary, ignored);
+                return false;
+            }
+#endif
+            return true;
         }
     );
 
